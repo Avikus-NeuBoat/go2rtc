@@ -1,0 +1,29 @@
+api:
+  listen: ":1984"
+  base_path: ""
+  static_dir: ""
+  origin: "*"
+hass:
+  config: ""
+
+log:
+  format: ""
+  level: "info"
+
+ngrok:
+  command: ""
+
+rtsp:
+  listen: ":8588"
+  username: ""
+  password: ""
+
+srtp:
+  listen: ":8443"
+
+streams:
+  camera0: rtsp://127.0.0.1:8554/test
+
+webrtc:
+  ice_servers:
+    - urls: [stun:localhost:3478]
