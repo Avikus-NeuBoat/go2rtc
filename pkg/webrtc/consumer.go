@@ -1,8 +1,8 @@
 package webrtc
 
 import (
-	"encoding/json"
 	"errors"
+
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/h264"
 	"github.com/AlexxIT/go2rtc/pkg/h265"
@@ -11,15 +11,15 @@ import (
 )
 
 func (c *Conn) GetMedias() []*core.Media {
-	return WithResampling(c.medias)
+	return WithResampling(c.Medias)
 }
 
 func (c *Conn) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
 	core.Assert(media.Direction == core.DirectionSendonly)
 
-	for _, sender := range c.senders {
+	for _, sender := range c.Senders {
 		if sender.Codec == codec {
-			sender.HandleRTP(track)
+			sender.Bind(track)
 			return nil
 		}
 	}
@@ -41,7 +41,7 @@ func (c *Conn) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiv
 
 	sender := core.NewSender(media, codec)
 	sender.Handler = func(packet *rtp.Packet) {
-		c.send += packet.MarshalSize()
+		c.Send += packet.MarshalSize()
 		//important to send with remote PayloadType
 		_ = localTrack.WriteRTP(payloadType, packet)
 	}
@@ -52,46 +52,39 @@ func (c *Conn) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiv
 		if track.Codec.IsRTP() {
 			sender.Handler = h264.RTPDepay(track.Codec, sender.Handler)
 		} else {
-			sender.Handler = h264.RepairAVC(track.Codec, sender.Handler)
+			sender.Handler = h264.RepairAVCC(track.Codec, sender.Handler)
 		}
 
 	case core.CodecH265:
-		// SafariPay because it is the only browser in the world
-		// that supports WebRTC + H265
-		sender.Handler = h265.SafariPay(1200, sender.Handler)
+		sender.Handler = h265.RTPPay(1200, sender.Handler)
 		if track.Codec.IsRTP() {
 			sender.Handler = h265.RTPDepay(track.Codec, sender.Handler)
+		} else {
+			sender.Handler = h265.RepairAVCC(track.Codec, sender.Handler)
 		}
 
-	case core.CodecPCMA, core.CodecPCMU, core.CodecPCM:
+	case core.CodecPCMA, core.CodecPCMU, core.CodecPCM, core.CodecPCML:
+		// Fix audio quality https://github.com/AlexxIT/WebRTC/issues/500
+		// should be before ResampleToG711, because it will be called last
+		sender.Handler = pcm.RepackG711(false, sender.Handler)
+
 		if codec.ClockRate == 0 {
-			if codec.Name == core.CodecPCM {
+			if codec.Name == core.CodecPCM || codec.Name == core.CodecPCML {
 				codec.Name = core.CodecPCMA
 			}
 			codec.ClockRate = 8000
-			sender.Handler = pcm.Resample(track.Codec, 8000, sender.Handler)
+			sender.Handler = pcm.ResampleToG711(track.Codec, 8000, sender.Handler)
 		}
-
-		// Fix audio quality https://github.com/AlexxIT/WebRTC/issues/500
-		sender.Handler = pcm.RepackG711(false, sender.Handler)
 	}
 
-	sender.HandleRTP(track)
+	// TODO: rewrite this dirty logic
+	// maybe not best solution, but ActiveProducer connected before AddTrack
+	if c.Mode != core.ModeActiveProducer {
+		sender.Bind(track)
+	} else {
+		sender.HandleRTP(track)
+	}
 
-	c.senders = append(c.senders, sender)
+	c.Senders = append(c.Senders, sender)
 	return nil
-}
-
-func (c *Conn) MarshalJSON() ([]byte, error) {
-	info := &core.Info{
-		Type:       c.Desc + " " + c.Mode.String(),
-		RemoteAddr: c.remote,
-		UserAgent:  c.UserAgent,
-		Medias:     c.medias,
-		Receivers:  c.receivers,
-		Senders:    c.senders,
-		Recv:       c.recv,
-		Send:       c.send,
-	}
-	return json.Marshal(info)
 }

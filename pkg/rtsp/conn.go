@@ -4,31 +4,34 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
-	"github.com/AlexxIT/go2rtc/pkg/core"
-	"github.com/AlexxIT/go2rtc/pkg/tcp"
-	"github.com/pion/rtcp"
-	"github.com/pion/rtp"
 	"io"
 	"net"
 	"net/url"
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/AlexxIT/go2rtc/pkg/core"
+	"github.com/AlexxIT/go2rtc/pkg/tcp"
+	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
 )
 
 type Conn struct {
+	core.Connection
 	core.Listener
 
 	// public
 
 	Backchannel bool
+	Media       string
+	OnClose     func() error
 	PacketSize  uint16
 	SessionName string
+	Timeout     int
 	Transport   string // custom transport support, ex. RTSP over WebSocket
 
-	Medias    []*core.Media
-	UserAgent string
-	URL       *url.URL
+	URL *url.URL
 
 	// internal
 
@@ -36,6 +39,7 @@ type Conn struct {
 	conn      net.Conn
 	keepalive int
 	mode      core.Mode
+	playOK    bool
 	reader    *bufio.Reader
 	sequence  int
 	session   string
@@ -43,14 +47,6 @@ type Conn struct {
 
 	state   State
 	stateMu sync.Mutex
-
-	receivers []*core.Receiver
-	senders   []*core.Sender
-
-	// stats
-
-	recv int
-	send int
 }
 
 const (
@@ -104,18 +100,26 @@ func (c *Conn) Handle() (err error) {
 		}
 		keepaliveTS = time.Now().Add(keepaliveDT)
 
-		// polling frames from remote RTSP Server (ex Camera)
-		if len(c.receivers) > 0 {
-			// if we receiving video/audio from camera
+		if c.Timeout == 0 {
+			// polling frames from remote RTSP Server (ex Camera)
 			timeout = time.Second * 5
+
+			if len(c.Receivers) == 0 {
+				// if we only send audio to camera
+				// https://github.com/AlexxIT/go2rtc/issues/659
+				timeout += keepaliveDT
+			}
 		} else {
-			// if we only send audio to camera
-			timeout = time.Second * 30
+			timeout = time.Second * time.Duration(c.Timeout)
 		}
 
 	case core.ModePassiveProducer:
 		// polling frames from remote RTSP Client (ex FFmpeg)
-		timeout = time.Second * 15
+		if c.Timeout == 0 {
+			timeout = time.Second * 15
+		} else {
+			timeout = time.Second * time.Duration(c.Timeout)
+		}
 
 	case core.ModePassiveConsumer:
 		// pushing frames to remote RTSP Client (ex VLC)
@@ -153,6 +157,8 @@ func (c *Conn) Handle() (err error) {
 					return
 				}
 				c.Fire(res)
+				// for playing backchannel only after OK response on play
+				c.playOK = true
 				continue
 
 			case "OPTI", "TEAR", "DESC", "SETU", "PLAY", "PAUS", "RECO", "ANNO", "GET_", "SET_":
@@ -161,6 +167,12 @@ func (c *Conn) Handle() (err error) {
 					return
 				}
 				c.Fire(req)
+				if req.Method == MethodOptions {
+					res := &tcp.Response{Request: req}
+					if err = c.WriteResponse(res); err != nil {
+						return
+					}
+				}
 				continue
 
 			default:
@@ -217,7 +229,7 @@ func (c *Conn) Handle() (err error) {
 			return
 		}
 
-		c.recv += int(size)
+		c.Recv += int(size)
 
 		if channelID&1 == 0 {
 			packet := &rtp.Packet{}
@@ -225,7 +237,7 @@ func (c *Conn) Handle() (err error) {
 				return
 			}
 
-			for _, receiver := range c.receivers {
+			for _, receiver := range c.Receivers {
 				if receiver.ID == channelID {
 					receiver.WriteRTP(packet)
 					break

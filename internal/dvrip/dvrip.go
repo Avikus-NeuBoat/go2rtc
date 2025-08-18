@@ -10,30 +10,14 @@ import (
 
 	"github.com/AlexxIT/go2rtc/internal/api"
 	"github.com/AlexxIT/go2rtc/internal/streams"
-	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/dvrip"
-	"github.com/rs/zerolog/log"
 )
 
 func Init() {
-	streams.HandleFunc("dvrip", handle)
+	streams.HandleFunc("dvrip", dvrip.Dial)
 
 	// DVRIP client autodiscovery
 	api.HandleFunc("api/dvrip", apiDvrip)
-}
-
-func handle(url string) (core.Producer, error) {
-	conn := dvrip.NewClient(url)
-	if err := conn.Dial(); err != nil {
-		return nil, err
-	}
-	if err := conn.Play(); err != nil {
-		return nil, err
-	}
-	if err := conn.Handle(); err != nil {
-		return nil, err
-	}
-	return conn, nil
 }
 
 const Port = 34569 // UDP port number for dvrip discovery
@@ -45,10 +29,10 @@ func apiDvrip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	api.ResponseStreams(w, items)
+	api.ResponseSources(w, items)
 }
 
-func discover() ([]api.Stream, error) {
+func discover() ([]*api.Source, error) {
 	addr := &net.UDPAddr{
 		Port: Port,
 		IP:   net.IP{239, 255, 255, 250},
@@ -63,7 +47,7 @@ func discover() ([]api.Stream, error) {
 
 	go sendBroadcasts(conn)
 
-	var items []api.Stream
+	var items []*api.Source
 
 	for _, info := range getResponses(conn) {
 		if info.HostIP == "" || info.HostName == "" {
@@ -75,7 +59,7 @@ func discover() ([]api.Stream, error) {
 			continue
 		}
 
-		items = append(items, api.Stream{
+		items = append(items, &api.Source{
 			Name: info.HostName,
 			URL:  "dvrip://user:pass@" + host + "?channel=0&subtype=0",
 		})
@@ -98,10 +82,7 @@ func sendBroadcasts(conn *net.UDPConn) {
 
 	for i := 0; i < 3; i++ {
 		time.Sleep(100 * time.Millisecond)
-
-		if _, err = conn.WriteToUDP(data, addr); err != nil {
-			log.Err(err).Caller().Send()
-		}
+		_, _ = conn.WriteToUDP(data, addr)
 	}
 }
 

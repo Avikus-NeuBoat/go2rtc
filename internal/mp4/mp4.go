@@ -1,17 +1,18 @@
 package mp4
 
 import (
-	"github.com/AlexxIT/go2rtc/internal/api/ws"
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/internal/api"
+	"github.com/AlexxIT/go2rtc/internal/api/ws"
 	"github.com/AlexxIT/go2rtc/internal/app"
 	"github.com/AlexxIT/go2rtc/internal/streams"
+	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/mp4"
-	"github.com/AlexxIT/go2rtc/pkg/tcp"
 	"github.com/rs/zerolog"
 )
 
@@ -46,18 +47,7 @@ func handlerKeyframe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	exit := make(chan []byte, 1)
-
-	cons := &mp4.Segment{OnlyKeyframe: true}
-	cons.Listen(func(msg any) {
-		if data, ok := msg.([]byte); ok && exit != nil {
-			select {
-			case exit <- data:
-			default:
-			}
-			exit = nil
-		}
-	})
+	cons := mp4.NewKeyframe(nil)
 
 	if err := stream.AddConsumer(cons); err != nil {
 		log.Error().Err(err).Caller().Send()
@@ -65,20 +55,21 @@ func handlerKeyframe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data := <-exit
+	once := &core.OnceBuffer{} // init and first frame
+	_, _ = cons.WriteTo(once)
 
 	stream.RemoveConsumer(cons)
 
 	// Apple Safari won't show frame without length
 	header := w.Header()
-	header.Set("Content-Length", strconv.Itoa(len(data)))
-	header.Set("Content-Type", cons.MimeType)
+	header.Set("Content-Length", strconv.Itoa(once.Len()))
+	header.Set("Content-Type", mp4.ContentType(cons.Codecs()))
 
 	if filename := query.Get("filename"); filename != "" {
 		header.Set("Content-Disposition", `attachment; filename="`+filename+`"`)
 	}
 
-	if _, err := w.Write(data); err != nil {
+	if _, err := once.WriteTo(w); err != nil {
 		log.Error().Err(err).Caller().Send()
 	}
 }
@@ -100,36 +91,17 @@ func handlerMP4(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	src := query.Get("src")
-	stream := streams.Get(src)
+	stream := streams.GetOrPatch(query)
 	if stream == nil {
 		http.Error(w, api.StreamNotFound, http.StatusNotFound)
 		return
 	}
 
-	exit := make(chan error, 1) // Add buffer to prevent blocking
-
-	cons := &mp4.Consumer{
-		Desc:       "MP4/HTTP",
-		RemoteAddr: tcp.RemoteAddr(r),
-		UserAgent:  r.UserAgent(),
-		Medias:     mp4.ParseQuery(r.URL.Query()),
-	}
-
-	cons.Listen(func(msg any) {
-		if exit == nil {
-			return
-		}
-		if data, ok := msg.([]byte); ok {
-			if _, err := w.Write(data); err != nil {
-				select {
-				case exit <- err:
-				default:
-				}
-				exit = nil
-			}
-		}
-	})
+	medias := mp4.ParseQuery(r.URL.Query())
+	cons := mp4.NewConsumer(medias)
+	cons.FormatName = "mp4"
+	cons.Protocol = "http"
+	cons.WithRequest(r)
 
 	if err := stream.AddConsumer(cons); err != nil {
 		log.Error().Err(err).Caller().Send()
@@ -137,51 +109,38 @@ func handlerMP4(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	defer stream.RemoveConsumer(cons)
+	if rotate := query.Get("rotate"); rotate != "" {
+		cons.Rotate = core.Atoi(rotate)
+	}
 
-	data, err := cons.Init()
-	if err != nil {
-		log.Error().Err(err).Caller().Send()
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	if scale := query.Get("scale"); scale != "" {
+		if sx, sy, ok := strings.Cut(scale, ":"); ok {
+			cons.ScaleX = core.Atoi(sx)
+			cons.ScaleY = core.Atoi(sy)
+		}
 	}
 
 	header := w.Header()
-	header.Set("Content-Type", cons.MimeType())
+	header.Set("Content-Type", mp4.ContentType(cons.Codecs()))
 
 	if filename := query.Get("filename"); filename != "" {
 		header.Set("Content-Disposition", `attachment; filename="`+filename+`"`)
 	}
 
-	if _, err = w.Write(data); err != nil {
-		log.Error().Err(err).Caller().Send()
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	ctx := r.Context() // handle when the client drops the connection
+
+	if i := core.Atoi(query.Get("duration")); i > 0 {
+		timeout := time.Second * time.Duration(i)
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
 	}
 
-	cons.Start()
+	go func() {
+		<-ctx.Done()
+		_ = cons.Stop()
+		stream.RemoveConsumer(cons)
+	}()
 
-	var duration *time.Timer
-	if s := query.Get("duration"); s != "" {
-		if i, _ := strconv.Atoi(s); i > 0 {
-			duration = time.AfterFunc(time.Second*time.Duration(i), func() {
-				if exit != nil {
-					select {
-					case exit <- nil:
-					default:
-					}
-					exit = nil
-				}
-			})
-		}
-	}
-
-	err = <-exit
-	exit = nil
-
-	log.Trace().Err(err).Caller().Send()
-
-	if duration != nil {
-		duration.Stop()
-	}
+	_, _ = cons.WriteTo(w)
 }

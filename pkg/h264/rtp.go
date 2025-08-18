@@ -2,7 +2,9 @@ package h264
 
 import (
 	"encoding/binary"
+
 	"github.com/AlexxIT/go2rtc/pkg/core"
+	"github.com/AlexxIT/go2rtc/pkg/h264/annexb"
 	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
 )
@@ -15,16 +17,22 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 	depack := &codecs.H264Packet{IsAVC: true}
 
 	sps, pps := GetParameterSet(codec.FmtpLine)
-	ps := EncodeAVC(sps, pps)
+	ps := JoinNALU(sps, pps)
 
 	buf := make([]byte, 0, 512*1024) // 512K
 
 	return func(packet *rtp.Packet) {
-		//log.Printf("[RTP] codec: %s, nalu: %2d, size: %6d, ts: %10d, pt: %2d, ssrc: %d, seq: %d, %v", track.Codec.Name, packet.Payload[0]&0x1F, len(packet.Payload), packet.Timestamp, packet.PayloadType, packet.SSRC, packet.SequenceNumber, packet.Marker)
+		//log.Printf("[RTP] codec: %s, nalu: %2d, size: %6d, ts: %10d, pt: %2d, ssrc: %d, seq: %d, %v", codec.Name, packet.Payload[0]&0x1F, len(packet.Payload), packet.Timestamp, packet.PayloadType, packet.SSRC, packet.SequenceNumber, packet.Marker)
 
 		payload, err := depack.Unmarshal(packet.Payload)
 		if len(payload) == 0 || err != nil {
 			return
+		}
+
+		// Memory overflow protection. Can happen if we miss a lot of packets with the marker.
+		// https://github.com/AlexxIT/go2rtc/issues/675
+		if len(buf) > 5*1024*1024 {
+			buf = buf[: 0 : 512*1024]
 		}
 
 		// Fix TP-Link Tapo TC70: sends SPS and PPS with packet.Marker = true
@@ -60,6 +68,9 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 
 					payload = payload[i:]
 					continue
+				case NALUTypePFrame, NALUTypeSPS, NALUTypePPS: // pass
+				default:
+					return // skip any unknown NAL unit type
 				}
 				break
 			}
@@ -81,10 +92,10 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 			// some Chinese buggy cameras has single packet with SPS+PPS+IFrame separated by 00 00 00 01
 			// https://github.com/AlexxIT/WebRTC/issues/391
 			// https://github.com/AlexxIT/WebRTC/issues/392
-			AnnexB2AVC(payload)
+			payload = annexb.FixAnnexBInAVCC(payload)
 		}
 
-		//log.Printf("[AVC] %v, len: %d, ts: %10d, seq: %d", Types(payload), len(payload), packet.Timestamp, packet.SequenceNumber)
+		//log.Printf("[AVC] %v, len: %d, ts: %10d, seq: %d", NALUTypes(payload), len(payload), packet.Timestamp, packet.SequenceNumber)
 
 		clone := *packet
 		clone.Version = RTPPacketVersionAVC

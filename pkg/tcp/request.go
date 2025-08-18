@@ -2,17 +2,37 @@ package tcp
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/AlexxIT/go2rtc/pkg/core"
 )
 
 // Do - http.Client with support Digest Authorization
 func Do(req *http.Request) (*http.Response, error) {
-	if secureClient == nil {
+	var secure *tls.Config
+
+	switch req.URL.Scheme {
+	case "httpx":
+		secure = insecureConfig
+		req.URL.Scheme = "https"
+	case "https":
+		if hostname := req.URL.Hostname(); IsIP(hostname) {
+			secure = insecureConfig
+		}
+	}
+
+	if secure != nil {
+		ctx := context.WithValue(req.Context(), secureKey, secure)
+		req = req.WithContext(ctx)
+	}
+
+	if client == nil {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
 
 		dial := transport.DialContext
@@ -23,31 +43,36 @@ func Do(req *http.Request) (*http.Response, error) {
 			}
 			return conn, err
 		}
+		transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dial(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
 
-		secureClient = &http.Client{
+			var conf *tls.Config
+			if v, ok := ctx.Value(secureKey).(*tls.Config); ok {
+				conf = v
+			} else if host, _, err := net.SplitHostPort(addr); err != nil {
+				conf = &tls.Config{ServerName: addr}
+			} else {
+				conf = &tls.Config{ServerName: host}
+			}
+
+			tlsConn := tls.Client(conn, conf)
+			if err = tlsConn.Handshake(); err != nil {
+				return nil, err
+			}
+
+			if pconn, ok := ctx.Value(connKey).(*net.Conn); ok {
+				*pconn = tlsConn
+			}
+			return tlsConn, err
+		}
+
+		client = &http.Client{
 			Timeout:   time.Second * 5000,
 			Transport: transport,
 		}
-	}
-
-	var client *http.Client
-
-	if req.URL.Scheme == "httpx" {
-		req.URL.Scheme = "https"
-
-		if insecureClient == nil {
-			transport := secureClient.Transport.(*http.Transport).Clone()
-			transport.TLSClientConfig.InsecureSkipVerify = true
-
-			insecureClient = &http.Client{
-				Timeout:   secureClient.Timeout,
-				Transport: transport,
-			}
-		}
-
-		client = insecureClient
-	} else {
-		client = secureClient
 	}
 
 	user := req.URL.User
@@ -88,11 +113,11 @@ func Do(req *http.Request) (*http.Response, error) {
 			response := HexMD5(ha1, nonce, ha2)
 			header = fmt.Sprintf(
 				`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s"`,
-				user, realm, nonce, uri, response,
+				username, realm, nonce, uri, response,
 			)
 		case "auth":
 			nc := "00000001"
-			cnonce := "00000001" // TODO: random...
+			cnonce := core.RandString(32, 64)
 			response := HexMD5(ha1, nonce, nc, cnonce, qop, ha2)
 			header = fmt.Sprintf(
 				`Digest username="%s", realm="%s", nonce="%s", uri="%s", qop=%s, nc=%s, cnonce="%s", response="%s"`,
@@ -112,8 +137,28 @@ func Do(req *http.Request) (*http.Response, error) {
 	return res, nil
 }
 
-var secureClient, insecureClient *http.Client
-var connKey struct{}
+var client *http.Client
+
+type key string
+
+var connKey = key("conn")
+var secureKey = key("secure")
+
+var insecureConfig = &tls.Config{
+	InsecureSkipVerify: true,
+	CipherSuites: []uint16{
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305, tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA, tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+
+		// this cipher suites disabled starting from https://tip.golang.org/doc/go1.22
+		// but cameras can't work without them https://github.com/AlexxIT/go2rtc/issues/1172
+		tls.TLS_RSA_WITH_AES_128_GCM_SHA256, // insecure
+		tls.TLS_RSA_WITH_AES_256_GCM_SHA384, // insecure
+	},
+}
 
 func WithConn() (context.Context, *net.Conn) {
 	pconn := new(net.Conn)
@@ -124,4 +169,8 @@ func Close(res *http.Response) {
 	if res.Body != nil {
 		_ = res.Body.Close()
 	}
+}
+
+func IsIP(hostname string) bool {
+	return net.ParseIP(hostname) != nil
 }

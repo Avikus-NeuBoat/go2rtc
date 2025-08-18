@@ -1,5 +1,7 @@
 package core
 
+import "encoding/json"
+
 const (
 	DirectionRecvonly = "recvonly"
 	DirectionSendonly = "sendonly"
@@ -18,6 +20,7 @@ const (
 	CodecVP9  = "VP9"
 	CodecAV1  = "AV1"
 	CodecJPEG = "JPEG" // payloadType: 26
+	CodecRAW  = "RAW"
 
 	CodecPCMU = "PCMU" // payloadType: 0
 	CodecPCMA = "PCMA" // payloadType: 8
@@ -25,7 +28,9 @@ const (
 	CodecOpus = "OPUS" // payloadType: 111
 	CodecG722 = "G722"
 	CodecMP3  = "MPA" // payload: 14, aka MPEG-1 Layer III
-	CodecPCM  = "L16" // Linear PCM
+	CodecPCM  = "L16" // Linear PCM (big endian)
+
+	CodecPCML = "PCML" // Linear PCM (little endian)
 
 	CodecELD  = "ELD" // AAC-ELD
 	CodecFLAC = "FLAC"
@@ -45,7 +50,10 @@ type Producer interface {
 	// GetTrack - return Receiver, that can only produce rtp.Packet(s)
 	GetTrack(media *Media, codec *Codec) (*Receiver, error)
 
+	// Deprecated: rename to Run()
 	Start() error
+
+	// Deprecated: rename to Close()
 	Stop() error
 }
 
@@ -57,6 +65,7 @@ type Consumer interface {
 
 	AddTrack(media *Media, codec *Codec, track *Receiver) error
 
+	// Deprecated: rename to Close()
 	Stop() error
 }
 
@@ -83,19 +92,6 @@ func (m Mode) String() string {
 	return "unknown"
 }
 
-type Info struct {
-	Type       string      `json:"type,omitempty"`
-	URL        string      `json:"url,omitempty"`
-	RemoteAddr string      `json:"remote_addr,omitempty"`
-	UserAgent  string      `json:"user_agent,omitempty"`
-	Medias     []*Media    `json:"medias,omitempty"`
-	Receivers  []*Receiver `json:"receivers,omitempty"`
-	Senders    []*Sender   `json:"senders,omitempty"`
-	Recv       int         `json:"recv,omitempty"`
-	Send       int         `json:"send,omitempty"`
+func (m Mode) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.String())
 }
-
-const (
-	UnsupportedCodec    = "unsupported codec"
-	WrongMediaDirection = "wrong media direction"
-)

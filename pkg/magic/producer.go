@@ -1,41 +1,69 @@
 package magic
 
 import (
-	"encoding/json"
+	"bytes"
+	"encoding/hex"
+	"errors"
+	"io"
+
+	"github.com/AlexxIT/go2rtc/pkg/aac"
 	"github.com/AlexxIT/go2rtc/pkg/core"
+	"github.com/AlexxIT/go2rtc/pkg/flv"
+	"github.com/AlexxIT/go2rtc/pkg/h264/annexb"
+	"github.com/AlexxIT/go2rtc/pkg/magic/bitstream"
+	"github.com/AlexxIT/go2rtc/pkg/magic/mjpeg"
+	"github.com/AlexxIT/go2rtc/pkg/mpegts"
+	"github.com/AlexxIT/go2rtc/pkg/mpjpeg"
+	"github.com/AlexxIT/go2rtc/pkg/wav"
+	"github.com/AlexxIT/go2rtc/pkg/y4m"
 )
 
-func (c *Client) GetMedias() []*core.Media {
-	return c.medias
-}
+func Open(r io.Reader) (core.Producer, error) {
+	rd := core.NewReadBuffer(r)
 
-func (c *Client) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
-	if c.receiver == nil {
-		c.receiver = core.NewReceiver(media, codec)
+	b, err := rd.Peek(4)
+	if err != nil {
+		return nil, err
 	}
-	return c.receiver, nil
-}
 
-func (c *Client) Start() error {
-	return c.Handle()
-}
+	switch string(b) {
+	case annexb.StartCode:
+		return bitstream.Open(rd)
+	case wav.FourCC:
+		return wav.Open(rd)
+	case y4m.FourCC:
+		return y4m.Open(rd)
+	}
 
-func (c *Client) Stop() (err error) {
-	if c.receiver != nil {
-		c.receiver.Close()
+	switch string(b[:3]) {
+	case flv.Signature:
+		return flv.Open(rd)
 	}
-	return c.Close()
-}
 
-func (c *Client) MarshalJSON() ([]byte, error) {
-	info := &core.Info{
-		Type:   c.Desc,
-		URL:    c.URL,
-		Medias: c.medias,
-		Recv:   c.recv,
+	switch string(b[:2]) {
+	case "\xFF\xD8":
+		return mjpeg.Open(rd)
+	case "\xFF\xF1", "\xFF\xF9":
+		return aac.Open(rd)
+	case "--":
+		return mpjpeg.Open(rd)
 	}
-	if c.receiver != nil {
-		info.Receivers = append(info.Receivers, c.receiver)
+
+	switch b[0] {
+	case mpegts.SyncByte:
+		return mpegts.Open(rd)
 	}
-	return json.Marshal(info)
+
+	// support MJPEG with trash on start
+	// https://github.com/AlexxIT/go2rtc/issues/747
+	if b, err = rd.Peek(4096); err != nil {
+		return nil, err
+	}
+
+	if i := bytes.Index(b, []byte{0xFF, 0xD8, 0xFF, 0xDB}); i > 0 {
+		_, _ = io.ReadFull(rd, make([]byte, i))
+		return mjpeg.Open(rd)
+	}
+
+	return nil, errors.New("magic: unsupported header: " + hex.EncodeToString(b[:4]))
 }

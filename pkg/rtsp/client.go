@@ -4,13 +4,14 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"github.com/AlexxIT/go2rtc/pkg/tcp/websocket"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/AlexxIT/go2rtc/pkg/tcp/websocket"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/tcp"
@@ -19,23 +20,34 @@ import (
 var Timeout = time.Second * 5
 
 func NewClient(uri string) *Conn {
-	return &Conn{uri: uri}
+	return &Conn{
+		Connection: core.Connection{
+			ID:         core.NewID(),
+			FormatName: "rtsp",
+		},
+		uri: uri,
+	}
 }
 
 func (c *Conn) Dial() (err error) {
-	var conn net.Conn
-
-	if c.Transport == "" {
-		conn, err = Dial(c.uri)
-	} else {
-		conn, err = websocket.Dial(c.Transport)
-	}
-
-	if err != nil {
+	if c.URL, err = url.Parse(c.uri); err != nil {
 		return
 	}
 
-	if c.URL, err = url.Parse(c.uri); err != nil {
+	var conn net.Conn
+
+	if c.Transport == "" {
+		timeout := core.ConnDialTimeout
+		if c.Timeout != 0 {
+			timeout = time.Second * time.Duration(c.Timeout)
+		}
+		conn, err = tcp.Dial(c.URL, timeout)
+		c.Protocol = "rtsp+tcp"
+	} else {
+		conn, err = websocket.Dial(c.Transport)
+		c.Protocol = "ws"
+	}
+	if err != nil {
 		return
 	}
 
@@ -44,10 +56,14 @@ func (c *Conn) Dial() (err error) {
 	c.URL.User = nil
 
 	c.conn = conn
-	c.reader = bufio.NewReader(conn)
+	c.reader = bufio.NewReaderSize(conn, core.BufferSize)
 	c.session = ""
 	c.sequence = 0
 	c.state = StateConn
+
+	c.Connection.RemoteAddr = conn.RemoteAddr().String()
+	c.Connection.Transport = conn
+	c.Connection.URL = c.uri
 
 	return nil
 }
@@ -139,9 +155,21 @@ func (c *Conn) Describe() error {
 		}
 	}
 
+	c.SDP = string(res.Body) // for info
+
 	medias, err := UnmarshalSDP(res.Body)
 	if err != nil {
 		return err
+	}
+
+	if c.Media != "" {
+		clone := make([]*core.Media, 0, len(medias))
+		for _, media := range medias {
+			if strings.Contains(c.Media, media.Kind) {
+				clone = append(clone, media)
+			}
+		}
+		medias = clone
 	}
 
 	// TODO: rewrite more smart
@@ -170,10 +198,20 @@ func (c *Conn) Announce() (err error) {
 		return err
 	}
 
-	res, err := c.Do(req)
+	_, err = c.Do(req)
+	return
+}
 
-	_ = res
+func (c *Conn) Record() (err error) {
+	req := &tcp.Request{
+		Method: MethodRecord,
+		URL:    c.URL,
+		Header: map[string][]string{
+			"Range": {"npt=0.000-"},
+		},
+	}
 
+	_, err = c.Do(req)
 	return
 }
 
@@ -199,7 +237,8 @@ func (c *Conn) SetupMedia(media *core.Media) (byte, error) {
 	rawURL := media.ID // control
 	if !strings.Contains(rawURL, "://") {
 		rawURL = c.URL.String()
-		if !strings.HasSuffix(rawURL, "/") {
+		// prefix check for https://github.com/AlexxIT/go2rtc/issues/1236
+		if !strings.HasSuffix(rawURL, "/") && !strings.HasPrefix(media.ID, "/") {
 			rawURL += "/"
 		}
 		rawURL += media.ID
@@ -284,6 +323,9 @@ func (c *Conn) Teardown() (err error) {
 func (c *Conn) Close() error {
 	if c.mode == core.ModeActiveProducer {
 		_ = c.Teardown()
+	}
+	if c.OnClose != nil {
+		_ = c.OnClose()
 	}
 	return c.conn.Close()
 }

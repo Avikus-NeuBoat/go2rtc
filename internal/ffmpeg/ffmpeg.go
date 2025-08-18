@@ -1,39 +1,57 @@
 package ffmpeg
 
 import (
-	"errors"
 	"net/url"
 	"strings"
 
+	"github.com/AlexxIT/go2rtc/internal/api"
 	"github.com/AlexxIT/go2rtc/internal/app"
 	"github.com/AlexxIT/go2rtc/internal/ffmpeg/device"
 	"github.com/AlexxIT/go2rtc/internal/ffmpeg/hardware"
+	"github.com/AlexxIT/go2rtc/internal/ffmpeg/virtual"
 	"github.com/AlexxIT/go2rtc/internal/rtsp"
 	"github.com/AlexxIT/go2rtc/internal/streams"
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/ffmpeg"
+	"github.com/rs/zerolog"
 )
 
 func Init() {
 	var cfg struct {
 		Mod map[string]string `yaml:"ffmpeg"`
+		Log struct {
+			Level string `yaml:"ffmpeg"`
+		} `yaml:"log"`
 	}
 
 	cfg.Mod = defaults // will be overriden from yaml
+	cfg.Log.Level = "error"
 
 	app.LoadConfig(&cfg)
 
-	if app.GetLogger("exec").GetLevel() >= 0 {
-		defaults["global"] += " -v error"
-	}
+	log = app.GetLogger("ffmpeg")
 
-	streams.HandleFunc("ffmpeg", func(url string) (core.Producer, error) {
-		args := parseArgs(url[7:]) // remove `ffmpeg:`
-		if args == nil {
-			return nil, errors.New("can't generate ffmpeg command")
+	// zerolog levels: trace debug         info warn    error fatal panic disabled
+	// FFmpeg  levels: trace debug verbose info warning error fatal panic quiet
+	if cfg.Log.Level == "warn" {
+		cfg.Log.Level = "warning"
+	}
+	defaults["global"] += " -v " + cfg.Log.Level
+
+	streams.RedirectFunc("ffmpeg", func(url string) (string, error) {
+		if _, err := Version(); err != nil {
+			return "", err
 		}
-		return streams.GetProducer("exec:" + args.String())
+		args := parseArgs(url[7:])
+		if core.Contains(args.Codecs, "auto") {
+			return "", nil // force call streams.HandleFunc("ffmpeg")
+		}
+		return "exec:" + args.String(), nil
 	})
+
+	streams.HandleFunc("ffmpeg", NewProducer)
+
+	api.HandleFunc("api/ffmpeg", apiFFmpeg)
 
 	device.Init(defaults["bin"])
 	hardware.Init(defaults["bin"])
@@ -53,57 +71,83 @@ var defaults = map[string]string{
 	// output
 	"output":       "-user_agent ffmpeg/go2rtc -rtsp_transport tcp -f rtsp {output}",
 	"output/mjpeg": "-f mjpeg -",
+	"output/raw":   "-f yuv4mpegpipe -",
+	"output/aac":   "-f adts -",
+	"output/wav":   "-f wav -",
 
 	// `-preset superfast` - we can't use ultrafast because it doesn't support `-profile main -level 4.1`
 	// `-tune zerolatency` - for minimal latency
 	// `-profile high -level 4.1` - most used streaming profile
-	"h264":  "-c:v libx264 -g 50 -profile:v high -level:v 4.1 -preset:v superfast -tune:v zerolatency -pix_fmt:v yuvj420p",
-	"h265":  "-c:v libx265 -g 50 -profile:v main -level:v 5.1 -preset:v superfast -tune:v zerolatency",
+	// `-pix_fmt:v yuv420p` - important for Telegram
+	"h264":  "-c:v libx264 -g 50 -profile:v high -level:v 4.1 -preset:v superfast -tune:v zerolatency -pix_fmt:v yuv420p",
+	"h265":  "-c:v libx265 -g 50 -profile:v main -level:v 5.1 -preset:v superfast -tune:v zerolatency -pix_fmt:v yuv420p",
 	"mjpeg": "-c:v mjpeg",
 	//"mjpeg": "-c:v mjpeg -force_duplicated_matrix:v 1 -huffman:v 0 -pix_fmt:v yuvj420p",
 
+	"raw":         "-c:v rawvideo",
+	"raw/gray8":   "-c:v rawvideo -pix_fmt:v gray8",
+	"raw/yuv420p": "-c:v rawvideo -pix_fmt:v yuv420p",
+	"raw/yuv422p": "-c:v rawvideo -pix_fmt:v yuv422p",
+	"raw/yuv444p": "-c:v rawvideo -pix_fmt:v yuv444p",
+
 	// https://ffmpeg.org/ffmpeg-codecs.html#libopus-1
 	// https://github.com/pion/webrtc/issues/1514
-	// `-af adelay=0|0` - force frame_size=960, important for WebRTC audio quality
-	"opus":       "-c:a libopus -ar:a 48000 -ac:a 2 -application:a voip -af adelay=0|0",
+	// https://ffmpeg.org/ffmpeg-resampler.html
+	// `-async 1` or `-min_comp 0` - force resampling for static timestamp inc, important for WebRTC audio quality
+	"opus":       "-c:a libopus -application:a lowdelay -min_comp 0",
+	"opus/16000": "-c:a libopus -application:a lowdelay -min_comp 0 -ar:a 16000 -ac:a 1",
 	"pcmu":       "-c:a pcm_mulaw -ar:a 8000 -ac:a 1",
+	"pcmu/8000":  "-c:a pcm_mulaw -ar:a 8000 -ac:a 1",
 	"pcmu/16000": "-c:a pcm_mulaw -ar:a 16000 -ac:a 1",
 	"pcmu/48000": "-c:a pcm_mulaw -ar:a 48000 -ac:a 1",
 	"pcma":       "-c:a pcm_alaw -ar:a 8000 -ac:a 1",
+	"pcma/8000":  "-c:a pcm_alaw -ar:a 8000 -ac:a 1",
 	"pcma/16000": "-c:a pcm_alaw -ar:a 16000 -ac:a 1",
 	"pcma/48000": "-c:a pcm_alaw -ar:a 48000 -ac:a 1",
 	"aac":        "-c:a aac", // keep sample rate and channels
 	"aac/16000":  "-c:a aac -ar:a 16000 -ac:a 1",
 	"mp3":        "-c:a libmp3lame -q:a 8",
 	"pcm":        "-c:a pcm_s16be -ar:a 8000 -ac:a 1",
+	"pcm/8000":   "-c:a pcm_s16be -ar:a 8000 -ac:a 1",
 	"pcm/16000":  "-c:a pcm_s16be -ar:a 16000 -ac:a 1",
 	"pcm/48000":  "-c:a pcm_s16be -ar:a 48000 -ac:a 1",
+	"pcml":       "-c:a pcm_s16le -ar:a 8000 -ac:a 1",
+	"pcml/8000":  "-c:a pcm_s16le -ar:a 8000 -ac:a 1",
+	"pcml/44100": "-c:a pcm_s16le -ar:a 44100 -ac:a 1",
 
 	// hardware Intel and AMD on Linux
 	// better not to set `-async_depth:v 1` like for QSV, because framedrops
 	// `-bf 0` - disable B-frames is very important
 	"h264/vaapi":  "-c:v h264_vaapi -g 50 -bf 0 -profile:v high -level:v 4.1 -sei:v 0",
-	"h265/vaapi":  "-c:v hevc_vaapi -g 50 -bf 0 -profile:v high -level:v 5.1 -sei:v 0",
+	"h265/vaapi":  "-c:v hevc_vaapi -g 50 -bf 0 -profile:v main -level:v 5.1 -sei:v 0",
 	"mjpeg/vaapi": "-c:v mjpeg_vaapi",
 
 	// hardware Raspberry
 	"h264/v4l2m2m": "-c:v h264_v4l2m2m -g 50 -bf 0",
 	"h265/v4l2m2m": "-c:v hevc_v4l2m2m -g 50 -bf 0",
 
+	// hardware Rockchip
+	// important to use custom ffmpeg https://github.com/AlexxIT/go2rtc/issues/768
+	// hevc - doesn't have a profile setting
+	"h264/rkmpp": "-c:v h264_rkmpp_encoder -g 50 -bf 0 -profile:v high -level:v 4.1",
+	"h265/rkmpp": "-c:v hevc_rkmpp_encoder -g 50 -bf 0 -level:v 5.1",
+
 	// hardware NVidia on Linux and Windows
 	// preset=p2 - faster, tune=ll - low latency
 	"h264/cuda": "-c:v h264_nvenc -g 50 -bf 0 -profile:v high -level:v auto -preset:v p2 -tune:v ll",
-	"h265/cuda": "-c:v hevc_nvenc -g 50 -bf 0 -profile:v high -level:v auto",
+	"h265/cuda": "-c:v hevc_nvenc -g 50 -bf 0 -profile:v main -level:v auto",
 
 	// hardware Intel on Windows
 	"h264/dxva2":  "-c:v h264_qsv -g 50 -bf 0 -profile:v high -level:v 4.1 -async_depth:v 1",
-	"h265/dxva2":  "-c:v hevc_qsv -g 50 -bf 0 -profile:v high -level:v 5.1 -async_depth:v 1",
-	"mjpeg/dxva2": "-c:v mjpeg_qsv -profile:v high -level:v 5.1",
+	"h265/dxva2":  "-c:v hevc_qsv -g 50 -bf 0 -profile:v main -level:v 5.1 -async_depth:v 1",
+	"mjpeg/dxva2": "-c:v mjpeg_qsv",
 
 	// hardware macOS
 	"h264/videotoolbox": "-c:v h264_videotoolbox -g 50 -bf 0 -profile:v high -level:v 4.1",
-	"h265/videotoolbox": "-c:v hevc_videotoolbox -g 50 -bf 0 -profile:v high -level:v 5.1",
+	"h265/videotoolbox": "-c:v hevc_videotoolbox -g 50 -bf 0 -profile:v main -level:v 5.1",
 }
+
+var log zerolog.Logger
 
 // configTemplate - return template from config (defaults) if exist or return raw template
 func configTemplate(template string) string {
@@ -129,13 +173,15 @@ func inputTemplate(name, s string, query url.Values) string {
 func parseArgs(s string) *ffmpeg.Args {
 	// init FFmpeg arguments
 	args := &ffmpeg.Args{
-		Bin:    defaults["bin"],
-		Global: defaults["global"],
-		Output: defaults["output"],
+		Bin:     defaults["bin"],
+		Global:  defaults["global"],
+		Output:  defaults["output"],
+		Version: verAV,
 	}
 
+	var source = s
 	var query url.Values
-	if i := strings.IndexByte(s, '#'); i > 0 {
+	if i := strings.IndexByte(s, '#'); i >= 0 {
 		query = streams.ParseQuery(s[i+1:])
 		args.Video = len(query["video"])
 		args.Audio = len(query["audio"])
@@ -176,12 +222,19 @@ func parseArgs(s string) *ffmpeg.Args {
 		default:
 			s += "?video&audio"
 		}
+		s += "&source=ffmpeg:" + url.QueryEscape(source)
+		for _, v := range query["query"] {
+			s += "&" + v
+		}
 		args.Input = inputTemplate("rtsp", s, query)
-	} else if strings.HasPrefix(s, "device?") {
-		var err error
-		args.Input, err = device.GetInput(s)
-		if err != nil {
-			return nil
+	} else if i = strings.Index(s, "?"); i > 0 {
+		switch s[:i] {
+		case "device":
+			args.Input = device.GetInput(s[i+1:])
+		case "virtual":
+			args.Input = virtual.GetInput(s[i+1:])
+		case "tts":
+			args.Input = virtual.GetInputTTS(s[i+1:])
 		}
 	} else {
 		args.Input = inputTemplate("file", s, query)
@@ -264,6 +317,12 @@ func parseArgs(s string) *ffmpeg.Args {
 			}
 		}
 
+		if query["bitrate"] != nil {
+			// https://trac.ffmpeg.org/wiki/Limiting%20the%20output%20bitrate
+			b := query["bitrate"][0]
+			args.AddCodec("-b:v " + b + " -maxrate " + b + " -bufsize " + b)
+		}
+
 		// 4. Process audio codecs
 		if args.Audio > 0 {
 			for _, audio := range query["audio"] {
@@ -293,11 +352,27 @@ func parseArgs(s string) *ffmpeg.Args {
 		args.AddCodec("-an")
 	}
 
-	// transcoding to only mjpeg
-	if (args.Video == 1 && args.Audio == 0 && query.Get("video") == "mjpeg") ||
-		// no transcoding from mjpeg input
-		(args.Video == 0 && args.Audio == 0 && strings.Contains(args.Input, " mjpeg ")) {
-		args.Output = defaults["output/mjpeg"]
+	// change otput from RTSP to some other pipe format
+	switch {
+	case args.Video == 0 && args.Audio == 0:
+		// no transcoding from mjpeg input (ffmpeg device with support output as raw MJPEG)
+		if strings.Contains(args.Input, " mjpeg ") {
+			args.Output = defaults["output/mjpeg"]
+		}
+	case args.Video == 1 && args.Audio == 0:
+		switch core.Before(query.Get("video"), "/") {
+		case "mjpeg":
+			args.Output = defaults["output/mjpeg"]
+		case "raw":
+			args.Output = defaults["output/raw"]
+		}
+	case args.Video == 0 && args.Audio == 1:
+		switch core.Before(query.Get("audio"), "/") {
+		case "aac":
+			args.Output = defaults["output/aac"]
+		case "pcma", "pcmu", "pcml":
+			args.Output = defaults["output/wav"]
+		}
 	}
 
 	return args

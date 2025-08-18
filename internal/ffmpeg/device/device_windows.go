@@ -1,11 +1,14 @@
+//go:build windows
+
 package device
 
 import (
-	"github.com/AlexxIT/go2rtc/internal/api"
-	"github.com/AlexxIT/go2rtc/pkg/core"
 	"net/url"
 	"os/exec"
 	"regexp"
+
+	"github.com/AlexxIT/go2rtc/internal/api"
+	"github.com/AlexxIT/go2rtc/pkg/core"
 )
 
 func queryToInput(query url.Values) string {
@@ -44,28 +47,18 @@ func queryToInput(query url.Values) string {
 	}
 
 	if video != "" {
-		input += ` -i video="` + video + `"`
+		input += ` -i "video=` + video
 
 		if audio != "" {
-			input += `:audio="` + audio + `"`
+			input += `:audio=` + audio
 		}
+
+		input += `"`
 	} else {
-		input += ` -i audio="` + audio + `"`
+		input += ` -i "audio=` + audio + `"`
 	}
 
 	return input
-}
-
-func deviceInputSuffix(video, audio string) string {
-	switch {
-	case video != "" && audio != "":
-		return `video="` + video + `":audio=` + audio + `"`
-	case video != "":
-		return `video="` + video + `"`
-	case audio != "":
-		return `audio="` + audio + `"`
-	}
-	return ""
 }
 
 func initDevices() {
@@ -79,7 +72,7 @@ func initDevices() {
 		name := m[1]
 		kind := m[2]
 
-		stream := api.Stream{
+		stream := &api.Source{
 			Name: name, URL: "ffmpeg:device?" + kind + "=" + name,
 		}
 
@@ -89,6 +82,7 @@ func initDevices() {
 			stream.URL += "#video=h264#hardware"
 		case core.KindAudio:
 			audios = append(audios, name)
+			stream.URL += "&channels=1&sample_rate=16000&audio_buffer_size=10"
 		}
 
 		streams = append(streams, stream)

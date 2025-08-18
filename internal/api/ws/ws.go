@@ -1,15 +1,18 @@
 package ws
 
 import (
-	"github.com/AlexxIT/go2rtc/internal/api"
-	"github.com/AlexxIT/go2rtc/internal/app"
-	"github.com/gorilla/websocket"
-	"github.com/rs/zerolog/log"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/AlexxIT/go2rtc/internal/api"
+	"github.com/AlexxIT/go2rtc/internal/app"
+	"github.com/gorilla/websocket"
+	"github.com/rs/zerolog"
 )
 
 func Init() {
@@ -21,10 +24,14 @@ func Init() {
 
 	app.LoadConfig(&cfg)
 
+	log = app.GetLogger("api")
+
 	initWS(cfg.Mod.Origin)
 
 	api.HandleFunc("api/ws", apiWS)
 }
+
+var log zerolog.Logger
 
 // Message - struct for data exchange in Web API
 type Message struct {
@@ -32,20 +39,19 @@ type Message struct {
 	Value any    `json:"value,omitempty"`
 }
 
-func (m *Message) String() string {
+func (m *Message) String() (value string) {
 	if s, ok := m.Value.(string); ok {
 		return s
 	}
-	return ""
+	return
 }
 
-func (m *Message) GetString(key string) string {
-	if v, ok := m.Value.(map[string]any); ok {
-		if s, ok := v[key].(string); ok {
-			return s
-		}
+func (m *Message) Unmarshal(v any) error {
+	b, err := json.Marshal(m.Value)
+	if err != nil {
+		return err
 	}
-	return ""
+	return json.Unmarshal(b, v)
 }
 
 type WSHandler func(tr *Transport, msg *Message) error
@@ -77,7 +83,7 @@ func initWS(origin string) {
 			if o.Host == r.Host {
 				return true
 			}
-			log.Trace().Msgf("[api.ws] origin=%s, host=%s", o.Host, r.Host)
+			log.Trace().Msgf("[api] ws origin=%s, host=%s", o.Host, r.Host)
 			// https://github.com/AlexxIT/go2rtc/issues/118
 			if i := strings.IndexByte(o.Host, ':'); i > 0 {
 				return o.Host[:i] == r.Host
@@ -101,13 +107,13 @@ func apiWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tr := &Transport{Request: r}
-	tr.OnWrite(func(msg any) {
+	tr.OnWrite(func(msg any) error {
 		_ = ws.SetWriteDeadline(time.Now().Add(time.Second * 5))
 
 		if data, ok := msg.([]byte); ok {
-			_ = ws.WriteMessage(websocket.BinaryMessage, data)
+			return ws.WriteMessage(websocket.BinaryMessage, data)
 		} else {
-			_ = ws.WriteJSON(msg)
+			return ws.WriteJSON(msg)
 		}
 	})
 
@@ -121,7 +127,7 @@ func apiWS(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		log.Trace().Str("type", msg.Type).Msg("[api.ws] msg")
+		log.Trace().Str("type", msg.Type).Msg("[api] ws msg")
 
 		if handler := wsHandlers[msg.Type]; handler != nil {
 			go func() {
@@ -147,11 +153,11 @@ type Transport struct {
 	wrmx   sync.Mutex
 
 	onChange func()
-	onWrite  func(msg any)
+	onWrite  func(msg any) error
 	onClose  []func()
 }
 
-func (t *Transport) OnWrite(f func(msg any)) {
+func (t *Transport) OnWrite(f func(msg any) error) {
 	t.mx.Lock()
 	if t.onChange != nil {
 		t.onChange()
@@ -162,7 +168,7 @@ func (t *Transport) OnWrite(f func(msg any)) {
 
 func (t *Transport) Write(msg any) {
 	t.wrmx.Lock()
-	t.onWrite(msg)
+	_ = t.onWrite(msg)
 	t.wrmx.Unlock()
 }
 
@@ -199,4 +205,21 @@ func (t *Transport) WithContext(f func(ctx map[any]any)) {
 	}
 	f(t.ctx)
 	t.mx.Unlock()
+}
+
+func (t *Transport) Writer() io.Writer {
+	return &writer{t: t}
+}
+
+type writer struct {
+	t *Transport
+}
+
+func (w *writer) Write(p []byte) (n int, err error) {
+	w.t.wrmx.Lock()
+	if err = w.t.onWrite(p); err == nil {
+		n = len(p)
+	}
+	w.t.wrmx.Unlock()
+	return
 }

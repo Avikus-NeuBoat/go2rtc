@@ -1,91 +1,116 @@
 package magic
 
 import (
+	"io"
+
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/h264"
+	"github.com/AlexxIT/go2rtc/pkg/h264/annexb"
 	"github.com/AlexxIT/go2rtc/pkg/h265"
 	"github.com/AlexxIT/go2rtc/pkg/mjpeg"
 	"github.com/pion/rtp"
 )
 
 type Keyframe struct {
-	core.Listener
-
-	UserAgent  string
-	RemoteAddr string
-
-	medias []*core.Media
-	sender *core.Sender
+	core.Connection
+	wr *core.WriteBuffer
 }
 
-func (k *Keyframe) GetMedias() []*core.Media {
-	if k.medias == nil {
-		k.medias = append(k.medias, &core.Media{
+// Deprecated: should be rewritten
+func NewKeyframe() *Keyframe {
+	medias := []*core.Media{
+		{
 			Kind:      core.KindVideo,
 			Direction: core.DirectionSendonly,
 			Codecs: []*core.Codec{
+				{Name: core.CodecJPEG},
+				{Name: core.CodecRAW},
 				{Name: core.CodecH264},
 				{Name: core.CodecH265},
-				{Name: core.CodecJPEG},
 			},
-		})
+		},
 	}
-	return k.medias
+	wr := core.NewWriteBuffer(nil)
+	return &Keyframe{
+		Connection: core.Connection{
+			ID:         core.NewID(),
+			FormatName: "keyframe",
+			Medias:     medias,
+			Transport:  wr,
+		},
+		wr: wr,
+	}
 }
 
 func (k *Keyframe) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiver) error {
-	var handler core.HandlerFunc
+	sender := core.NewSender(media, track.Codec)
 
 	switch track.Codec.Name {
 	case core.CodecH264:
-		handler = func(packet *rtp.Packet) {
+		sender.Handler = func(packet *rtp.Packet) {
 			if !h264.IsKeyframe(packet.Payload) {
 				return
 			}
-			b := h264.AVCtoAnnexB(packet.Payload)
-			k.Fire(b)
+			b := annexb.DecodeAVCC(packet.Payload, true)
+			if n, err := k.wr.Write(b); err == nil {
+				k.Send += n
+			}
 		}
 
 		if track.Codec.IsRTP() {
-			handler = h264.RTPDepay(track.Codec, handler)
+			sender.Handler = h264.RTPDepay(track.Codec, sender.Handler)
+		} else {
+			sender.Handler = h264.RepairAVCC(track.Codec, sender.Handler)
 		}
+
 	case core.CodecH265:
-		handler = func(packet *rtp.Packet) {
+		sender.Handler = func(packet *rtp.Packet) {
 			if !h265.IsKeyframe(packet.Payload) {
 				return
 			}
-			k.Fire(packet.Payload)
+			b := annexb.DecodeAVCC(packet.Payload, true)
+			if n, err := k.wr.Write(b); err == nil {
+				k.Send += n
+			}
 		}
 
 		if track.Codec.IsRTP() {
-			handler = h265.RTPDepay(track.Codec, handler)
+			sender.Handler = h265.RTPDepay(track.Codec, sender.Handler)
 		}
+
 	case core.CodecJPEG:
-		handler = func(packet *rtp.Packet) {
-			k.Fire(packet.Payload)
+		sender.Handler = func(packet *rtp.Packet) {
+			if n, err := k.wr.Write(packet.Payload); err == nil {
+				k.Send += n
+			}
 		}
 
 		if track.Codec.IsRTP() {
-			handler = mjpeg.RTPDepay(handler)
+			sender.Handler = mjpeg.RTPDepay(sender.Handler)
 		}
+
+	case core.CodecRAW:
+		sender.Handler = func(packet *rtp.Packet) {
+			if n, err := k.wr.Write(packet.Payload); err == nil {
+				k.Send += n
+			}
+		}
+
+		sender.Handler = mjpeg.Encoder(track.Codec, 5, sender.Handler)
 	}
 
-	k.sender = core.NewSender(media, track.Codec)
-	k.sender.Handler = handler
-	k.sender.HandleRTP(track)
+	sender.HandleRTP(track)
+	k.Senders = append(k.Senders, sender)
 	return nil
 }
 
 func (k *Keyframe) CodecName() string {
-	if k.sender != nil {
-		return k.sender.Codec.Name
+	if len(k.Senders) != 1 {
+		return ""
 	}
-	return ""
+	return k.Senders[0].Codec.Name
 }
 
-func (k *Keyframe) Stop() error {
-	if k.sender != nil {
-		k.sender.Close()
-	}
-	return nil
+func (k *Keyframe) WriteTo(wr io.Writer) (int64, error) {
+	return k.wr.WriteTo(wr)
 }

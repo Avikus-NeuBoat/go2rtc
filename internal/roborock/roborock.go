@@ -2,28 +2,20 @@ package roborock
 
 import (
 	"fmt"
+	"net/http"
+
 	"github.com/AlexxIT/go2rtc/internal/api"
 	"github.com/AlexxIT/go2rtc/internal/streams"
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/AlexxIT/go2rtc/pkg/roborock"
-	"net/http"
 )
 
 func Init() {
-	streams.HandleFunc("roborock", handle)
+	streams.HandleFunc("roborock", func(source string) (core.Producer, error) {
+		return roborock.Dial(source)
+	})
 
 	api.HandleFunc("api/roborock", apiHandle)
-}
-
-func handle(url string) (core.Producer, error) {
-	conn := roborock.NewClient(url)
-	if err := conn.Dial(); err != nil {
-		return nil, err
-	}
-	if err := conn.Connect(); err != nil {
-		return nil, err
-	}
-	return conn, nil
 }
 
 var Auth struct {
@@ -84,7 +76,7 @@ func apiHandle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var items []api.Stream
+	var items []*api.Source
 
 	for _, device := range devices {
 		source := fmt.Sprintf(
@@ -93,8 +85,8 @@ func apiHandle(w http.ResponseWriter, r *http.Request) {
 			Auth.UserData.IoT.User, Auth.UserData.IoT.Pass, Auth.UserData.IoT.Domain,
 			device.DID, device.Key,
 		)
-		items = append(items, api.Stream{Name: device.Name, URL: source})
+		items = append(items, &api.Source{Name: device.Name, URL: source})
 	}
 
-	api.ResponseStreams(w, items)
+	api.ResponseSources(w, items)
 }

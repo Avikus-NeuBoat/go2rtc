@@ -1,59 +1,108 @@
 package webrtc
 
 import (
-	"github.com/AlexxIT/go2rtc/internal/api/ws"
-	"github.com/AlexxIT/go2rtc/pkg/webrtc"
-	"github.com/pion/sdp/v3"
-	"strconv"
+	"net"
 	"strings"
+
+	"github.com/AlexxIT/go2rtc/internal/api/ws"
+	"github.com/AlexxIT/go2rtc/pkg/core"
+	"github.com/AlexxIT/go2rtc/pkg/webrtc"
+	"github.com/AlexxIT/go2rtc/pkg/xnet"
+	pion "github.com/pion/webrtc/v3"
 )
 
 type Address struct {
-	Host string
-	Port int
+	host     string
+	Port     string
+	Network  string
+	Priority uint32
 }
 
-var addresses []Address
-
-func AddCandidate(address string) {
-	var port int
-
-	// try to get port from address string
-	if i := strings.LastIndexByte(address, ':'); i > 0 {
-		if v, _ := strconv.Atoi(address[i+1:]); v != 0 {
-			address = address[:i]
-			port = v
+func (a *Address) Host() string {
+	if a.host == "stun" {
+		ip, err := webrtc.GetCachedPublicIP()
+		if err != nil {
+			return ""
 		}
+		return ip.String()
+	}
+	return a.host
+}
+
+func (a *Address) Marshal() string {
+	if host := a.Host(); host != "" {
+		return webrtc.CandidateICE(a.Network, host, a.Port, a.Priority)
+	}
+	return ""
+}
+
+var addresses []*Address
+var filters webrtc.Filters
+
+func AddCandidate(network, address string) {
+	if network == "" {
+		AddCandidate("tcp", address)
+		AddCandidate("udp", address)
+		return
 	}
 
-	// use default WebRTC port
-	if port == 0 {
-		port, _ = strconv.Atoi(Port)
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return
 	}
 
-	addresses = append(addresses, Address{Host: address, Port: port})
+	// start from 1, so manual candidates will be lower than built-in
+	// and every next candidate will have a lower priority
+	candidateIndex := 1 + len(addresses)
+
+	priority := webrtc.CandidateHostPriority(network, candidateIndex)
+	addresses = append(addresses, &Address{host, port, network, priority})
 }
 
 func GetCandidates() (candidates []string) {
 	for _, address := range addresses {
-		// using stun server for receive public IP-address
-		if address.Host == "stun" {
-			ip, err := webrtc.GetCachedPublicIP()
-			if err != nil {
-				continue
-			}
-			// this is a copy, original host unchanged
-			address.Host = ip.String()
+		if candidate := address.Marshal(); candidate != "" {
+			candidates = append(candidates, candidate)
 		}
+	}
+	return
+}
 
-		candidates = append(
-			candidates,
-			webrtc.CandidateManualHostUDP(address.Host, address.Port),
-			webrtc.CandidateManualHostTCPPassive(address.Host, address.Port),
-		)
+// FilterCandidate return true if candidate passed the check
+func FilterCandidate(candidate *pion.ICECandidate) bool {
+	if candidate == nil {
+		return false
 	}
 
-	return
+	// remove any Docker-like IP from candidates
+	if ip := net.ParseIP(candidate.Address); ip != nil && xnet.Docker.Contains(ip) {
+		return false
+	}
+
+	// host candidate should be in the hosts list
+	if candidate.Typ == pion.ICECandidateTypeHost && filters.Candidates != nil {
+		if !core.Contains(filters.Candidates, candidate.Address) {
+			return false
+		}
+	}
+
+	if filters.Networks != nil {
+		networkType := NetworkType(candidate.Protocol.String(), candidate.Address)
+		if !core.Contains(filters.Networks, networkType) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// NetworkType convert tcp/udp network to tcp4/tcp6/udp4/udp6
+func NetworkType(network, host string) string {
+	if strings.IndexByte(host, ':') >= 0 {
+		return network + "6"
+	} else {
+		return network + "4"
+	}
 }
 
 func asyncCandidates(tr *ws.Transport, cons *webrtc.Conn) {
@@ -76,30 +125,6 @@ func asyncCandidates(tr *ws.Transport, cons *webrtc.Conn) {
 		log.Trace().Str("candidate", candidate).Msg("[webrtc] config")
 		tr.Write(&ws.Message{Type: "webrtc/candidate", Value: candidate})
 	}
-}
-
-func syncCanditates(answer string) (string, error) {
-	if len(addresses) == 0 {
-		return answer, nil
-	}
-
-	sd := &sdp.SessionDescription{}
-	if err := sd.Unmarshal([]byte(answer)); err != nil {
-		return "", err
-	}
-
-	md := sd.MediaDescriptions[0]
-
-	for _, candidate := range GetCandidates() {
-		md.WithPropertyAttribute(candidate)
-	}
-
-	data, err := sd.Marshal()
-	if err != nil {
-		return "", err
-	}
-
-	return string(data), nil
 }
 
 func candidateHandler(tr *ws.Transport, msg *ws.Message) error {

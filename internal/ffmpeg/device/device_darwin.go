@@ -1,12 +1,15 @@
+//go:build darwin || ios
+
 package device
 
 import (
-	"github.com/AlexxIT/go2rtc/internal/api"
-	"github.com/AlexxIT/go2rtc/pkg/core"
 	"net/url"
 	"os/exec"
 	"regexp"
 	"strings"
+
+	"github.com/AlexxIT/go2rtc/internal/api"
+	"github.com/AlexxIT/go2rtc/pkg/core"
 )
 
 func queryToInput(query url.Values) string {
@@ -78,7 +81,7 @@ func initDevices() {
 			audios = append(audios, name)
 		}
 
-		streams = append(streams, api.Stream{
+		streams = append(streams, &api.Source{
 			Name: name, URL: "ffmpeg:device?" + kind + "=" + name,
 		})
 	}

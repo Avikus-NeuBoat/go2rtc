@@ -3,10 +3,11 @@ package streams
 import (
 	"encoding/json"
 	"errors"
-	"github.com/AlexxIT/go2rtc/pkg/core"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/AlexxIT/go2rtc/pkg/core"
 )
 
 type state byte
@@ -33,6 +34,24 @@ type Producer struct {
 	state    state
 	mu       sync.Mutex
 	workerID int
+}
+
+const SourceTemplate = "{input}"
+
+func NewProducer(source string) *Producer {
+	if strings.Contains(source, SourceTemplate) {
+		return &Producer{template: source}
+	}
+
+	return &Producer{url: source}
+}
+
+func (p *Producer) SetSource(s string) {
+	if p.template == "" {
+		p.url = s
+	} else {
+		p.url = strings.Replace(p.template, SourceTemplate, s, 1)
+	}
 }
 
 func (p *Producer) Dial() error {
@@ -112,19 +131,11 @@ func (p *Producer) AddTrack(media *core.Media, codec *core.Codec, track *core.Re
 	return nil
 }
 
-func (p *Producer) SetSource(s string) {
-	if p.template == "" {
-		p.template = p.url
-	}
-	p.url = strings.Replace(p.template, "{input}", s, 1)
-}
-
 func (p *Producer) MarshalJSON() ([]byte, error) {
-	if p.conn != nil {
-		return json.Marshal(p.conn)
+	if conn := p.conn; conn != nil {
+		return json.Marshal(conn)
 	}
-
-	info := core.Info{URL: p.url}
+	info := map[string]string{"url": p.url}
 	return json.Marshal(info)
 }
 
@@ -195,7 +206,7 @@ func (p *Producer) reconnect(workerID, retry int) {
 	for _, media := range conn.GetMedias() {
 		switch media.Direction {
 		case core.DirectionRecvonly:
-			for _, receiver := range p.receivers {
+			for i, receiver := range p.receivers {
 				codec := media.MatchCodec(receiver.Codec)
 				if codec == nil {
 					continue
@@ -207,6 +218,7 @@ func (p *Producer) reconnect(workerID, retry int) {
 				}
 
 				receiver.Replace(track)
+				p.receivers[i] = track
 				break
 			}
 
@@ -222,6 +234,9 @@ func (p *Producer) reconnect(workerID, retry int) {
 		}
 	}
 
+	// stop previous connection after moving tracks (fix ghost exec/ffmpeg)
+	_ = p.conn.Stop()
+	// swap connections
 	p.conn = conn
 
 	go p.worker(conn, workerID)
@@ -233,10 +248,10 @@ func (p *Producer) stop() {
 
 	switch p.state {
 	case stateExternal:
-		log.Debug().Msgf("[streams] can't stop external producer")
+		log.Trace().Msgf("[streams] skip stop external producer")
 		return
 	case stateNone:
-		log.Debug().Msgf("[streams] can't stop none producer")
+		log.Trace().Msgf("[streams] skip stop none producer")
 		return
 	case stateStart:
 		p.workerID++

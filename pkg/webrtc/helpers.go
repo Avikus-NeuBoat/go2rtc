@@ -1,18 +1,20 @@
 package webrtc
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/AlexxIT/go2rtc/pkg/core"
-	"github.com/pion/ice/v2"
-	"github.com/pion/sdp/v3"
-	"github.com/pion/stun"
-	"github.com/pion/webrtc/v3"
 	"hash/crc32"
 	"net"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/AlexxIT/go2rtc/pkg/core"
+	"github.com/pion/ice/v2"
+	"github.com/pion/sdp/v3"
+	"github.com/pion/stun"
+	"github.com/pion/webrtc/v3"
 )
 
 func UnmarshalMedias(descriptions []*sdp.MediaDescription) (medias []*core.Media) {
@@ -45,6 +47,9 @@ func UnmarshalMedias(descriptions []*sdp.MediaDescription) (medias []*core.Media
 				continue
 			}
 
+			// skip non-media codecs to avoid confusing users in info and logs
+			media.Codecs = SkipNonMediaCodecs(media.Codecs)
+
 			medias = append(medias, media)
 		}
 	}
@@ -52,13 +57,30 @@ func UnmarshalMedias(descriptions []*sdp.MediaDescription) (medias []*core.Media
 	return
 }
 
+func SkipNonMediaCodecs(input []*core.Codec) (output []*core.Codec) {
+	for _, codec := range input {
+		switch codec.Name {
+		case "RTX", "RED", "ULPFEC", "FLEXFEC-03":
+			continue
+		case "CN", "TELEPHONE-EVENT":
+			continue // https://datatracker.ietf.org/doc/html/rfc7874
+		}
+		// VP8, VP9, H264, H265, AV1
+		// OPUS, G722, PCMU, PCMA
+		output = append(output, codec)
+	}
+	return
+}
+
+// WithResampling - will add for consumer: PCMA/0, PCMU/0, PCM/0, PCML/0
+// so it can add resampling for PCMA/PCMU and repack for PCM/PCML
 func WithResampling(medias []*core.Media) []*core.Media {
 	for _, media := range medias {
 		if media.Kind != core.KindAudio || media.Direction != core.DirectionSendonly {
 			continue
 		}
 
-		var pcma, pcmu, pcm *core.Codec
+		var pcma, pcmu, pcm, pcml *core.Codec
 
 		for _, codec := range media.Codecs {
 			switch codec.Name {
@@ -76,6 +98,8 @@ func WithResampling(medias []*core.Media) []*core.Media {
 				}
 			case core.CodecPCM:
 				pcm = codec
+			case core.CodecPCML:
+				pcml = codec
 			}
 		}
 
@@ -93,6 +117,11 @@ func WithResampling(medias []*core.Media) []*core.Media {
 			pcm = pcma.Clone()
 			pcm.Name = core.CodecPCM
 			media.Codecs = append(media.Codecs, pcm)
+		}
+		if pcma != nil && pcml == nil {
+			pcml = pcma.Clone()
+			pcml.Name = core.CodecPCML
+			media.Codecs = append(media.Codecs, pcml)
 		}
 	}
 
@@ -244,42 +273,71 @@ func MimeType(codec *core.Codec) string {
 	panic("not implemented")
 }
 
-// 4.1.2.2.  Guidelines for Choosing Type and Local Preferences
-// The RECOMMENDED values are 126 for host candidates, 100
-// for server reflexive candidates, 110 for peer reflexive candidates,
-// and 0 for relayed candidates.
-
-// We use new priority 120 for Manual Host. It is lower than real Host,
-// but more then any other candidates.
-
-const PriorityManualHost = (1 << 24) * uint32(120)
-const PriorityLocalUDP = (1 << 8) * uint32(65535)
-const PriorityLocalTCPPassive = (1 << 8) * uint32((1<<13)*4+8191)
-const PriorityComponentRTP = uint32(256 - ice.ComponentRTP)
-
-func CandidateManualHostUDP(host string, port int) string {
-	foundation := crc32.ChecksumIEEE([]byte("host" + host + "udp4"))
-	priority := PriorityManualHost + PriorityLocalUDP + PriorityComponentRTP
-
+func CandidateICE(network, host, port string, priority uint32) string {
 	// 1. Foundation
 	// 2. Component, always 1 because RTP
-	// 3. udp or tcp
+	// 3. "udp" or "tcp"
 	// 4. Priority
 	// 5. Host - IP4 or IP6 or domain name
 	// 6. Port
-	// 7. typ host
-	return fmt.Sprintf(
-		"candidate:%d 1 udp %d %s %d typ host",
-		foundation, priority, host, port,
-	)
+	// 7. "typ host"
+	foundation := crc32.ChecksumIEEE([]byte("host" + host + network + "4"))
+	s := fmt.Sprintf("candidate:%d 1 %s %d %s %s typ host", foundation, network, priority, host, port)
+	if network == "tcp" {
+		return s + " tcptype passive"
+	}
+	return s
 }
 
-func CandidateManualHostTCPPassive(address string, port int) string {
-	foundation := crc32.ChecksumIEEE([]byte("host" + address + "tcp4"))
-	priority := PriorityManualHost + PriorityLocalTCPPassive + PriorityComponentRTP
+// Priority = type << 24 + local << 8 + component
+// https://www.rfc-editor.org/rfc/rfc8445#section-5.1.2.1
 
-	return fmt.Sprintf(
-		"candidate:%d 1 tcp %d %s %d typ host tcptype passive",
-		foundation, priority, address, port,
-	)
+const PriorityHostUDP uint32 = 0x001F_FFFF |
+	126<<24 | // udp host
+	7<<21 // udp
+const PriorityHostTCPPassive uint32 = 0x001F_FFFF |
+	99<<24 | // tcp host
+	4<<21 // tcp passive
+
+// CandidateHostPriority (lower indexes has a higher priority)
+func CandidateHostPriority(network string, index int) uint32 {
+	switch network {
+	case "udp":
+		return PriorityHostUDP - uint32(index)
+	case "tcp":
+		return PriorityHostTCPPassive - uint32(index)
+	}
+	return 0
+}
+
+func UnmarshalICEServers(b []byte) ([]webrtc.ICEServer, error) {
+	type ICEServer struct {
+		URLs       any    `json:"urls"`
+		Username   string `json:"username,omitempty"`
+		Credential string `json:"credential,omitempty"`
+	}
+
+	var src []ICEServer
+	if err := json.Unmarshal(b, &src); err != nil {
+		return nil, err
+	}
+
+	var dst []webrtc.ICEServer
+	for i := range src {
+		srv := webrtc.ICEServer{
+			Username:   src[i].Username,
+			Credential: src[i].Credential,
+		}
+
+		switch v := src[i].URLs.(type) {
+		case []string:
+			srv.URLs = v
+		case string:
+			srv.URLs = []string{v}
+		}
+
+		dst = append(dst, srv)
+	}
+
+	return dst, nil
 }

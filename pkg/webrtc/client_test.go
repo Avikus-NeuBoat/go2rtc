@@ -1,15 +1,16 @@
 package webrtc
 
 import (
+	"testing"
+
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/pion/webrtc/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"testing"
 )
 
 func TestClient(t *testing.T) {
-	api, err := NewAPI("")
+	api, err := NewAPI()
 	require.Nil(t, err)
 
 	pc, err := api.NewPeerConnection(webrtc.Configuration{})
@@ -99,4 +100,11 @@ a=recvonly
 
 	err = sender.ReplaceTrack(track)
 	require.Nil(t, err)
+}
+
+func TestUnmarshalICEServers(t *testing.T) {
+	s := `[{"credential":"xxx","urls":"xxx","username":"xxx"},{"credential":null,"urls":"xxx","username":null}]`
+	servers, err := UnmarshalICEServers([]byte(s))
+	require.Nil(t, err)
+	require.Len(t, servers, 2)
 }

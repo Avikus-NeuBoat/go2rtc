@@ -1,16 +1,18 @@
 package onvif
 
 import (
-	"github.com/AlexxIT/go2rtc/pkg/core"
+	"fmt"
 	"net"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/AlexxIT/go2rtc/pkg/core"
 )
 
 func FindTagValue(b []byte, tag string) string {
-	re := regexp.MustCompile(`<[^/>]*` + tag + `[^>]*>([^<]+)`)
+	re := regexp.MustCompile(`(?s)<(?:\w+:)?` + tag + `\b[^>]*>([^<]+)`)
 	m := re.FindSubmatch(b)
 	if len(m) != 2 {
 		return ""
@@ -104,4 +106,26 @@ func atoi(s string) int {
 		return -1
 	}
 	return i
+}
+
+func GetPosixTZ(current time.Time) string {
+	// Thanks to https://github.com/Path-Variable/go-posix-time
+	_, offset := current.Zone()
+
+	if current.IsDST() {
+		_, end := current.ZoneBounds()
+		endPlus1 := end.Add(time.Hour * 25)
+		_, offset = endPlus1.Zone()
+	}
+
+	var prefix string
+	if offset < 0 {
+		prefix = "GMT+"
+		offset = -offset / 60
+	} else {
+		prefix = "GMT-"
+		offset = offset / 60
+	}
+
+	return prefix + fmt.Sprintf("%02d:%02d", offset/60, offset%60)
 }
