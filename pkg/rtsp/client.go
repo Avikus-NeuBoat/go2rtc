@@ -17,7 +17,7 @@ import (
 	"github.com/AlexxIT/go2rtc/pkg/tcp"
 )
 
-var Timeout = time.Second * 5
+var Timeout = time.Second * 30
 
 func NewClient(uri string) *Conn {
 	return &Conn{
