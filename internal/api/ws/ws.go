@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/url"
@@ -11,7 +12,7 @@ import (
 	"github.com/AlexxIT/go2rtc/internal/api"
 	"github.com/AlexxIT/go2rtc/internal/app"
 	"github.com/gorilla/websocket"
-	"github.com/rs/zerolog/log"
+	"github.com/rs/zerolog"
 )
 
 func Init() {
@@ -23,10 +24,14 @@ func Init() {
 
 	app.LoadConfig(&cfg)
 
+	log = app.GetLogger("api")
+
 	initWS(cfg.Mod.Origin)
 
 	api.HandleFunc("api/ws", apiWS)
 }
+
+var log zerolog.Logger
 
 // Message - struct for data exchange in Web API
 type Message struct {
@@ -34,20 +39,19 @@ type Message struct {
 	Value any    `json:"value,omitempty"`
 }
 
-func (m *Message) String() string {
+func (m *Message) String() (value string) {
 	if s, ok := m.Value.(string); ok {
 		return s
 	}
-	return ""
+	return
 }
 
-func (m *Message) GetString(key string) string {
-	if v, ok := m.Value.(map[string]any); ok {
-		if s, ok := v[key].(string); ok {
-			return s
-		}
+func (m *Message) Unmarshal(v any) error {
+	b, err := json.Marshal(m.Value)
+	if err != nil {
+		return err
 	}
-	return ""
+	return json.Unmarshal(b, v)
 }
 
 type WSHandler func(tr *Transport, msg *Message) error
@@ -79,7 +83,7 @@ func initWS(origin string) {
 			if o.Host == r.Host {
 				return true
 			}
-			log.Trace().Msgf("[api.ws] origin=%s, host=%s", o.Host, r.Host)
+			log.Trace().Msgf("[api] ws origin=%s, host=%s", o.Host, r.Host)
 			// https://github.com/AlexxIT/go2rtc/issues/118
 			if i := strings.IndexByte(o.Host, ':'); i > 0 {
 				return o.Host[:i] == r.Host
@@ -123,7 +127,7 @@ func apiWS(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		log.Trace().Str("type", msg.Type).Msg("[api.ws] msg")
+		log.Trace().Str("type", msg.Type).Msg("[api] ws msg")
 
 		if handler := wsHandlers[msg.Type]; handler != nil {
 			go func() {

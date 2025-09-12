@@ -11,9 +11,9 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/internal/app"
-	"github.com/AlexxIT/go2rtc/pkg/shell"
 	"github.com/rs/zerolog"
 )
 
@@ -69,6 +69,8 @@ func Init() {
 	}
 
 	if cfg.Mod.Listen != "" {
+		_, port, _ := net.SplitHostPort(cfg.Mod.Listen)
+		Port, _ = strconv.Atoi(port)
 		go listen("tcp", cfg.Mod.Listen)
 	}
 
@@ -92,11 +94,10 @@ func listen(network, address string) {
 
 	log.Info().Str("addr", address).Msg("[api] listen")
 
-	if network == "tcp" {
-		Port = ln.Addr().(*net.TCPAddr).Port
+	server := http.Server{
+		Handler:           Handler,
+		ReadHeaderTimeout: 5 * time.Second, // Example: Set to 5 seconds
 	}
-
-	server := http.Server{Handler: Handler}
 	if err = server.Serve(ln); err != nil {
 		log.Fatal().Err(err).Msg("[api] serve")
 	}
@@ -126,8 +127,9 @@ func tlsListen(network, address, certFile, keyFile string) {
 	log.Info().Str("addr", address).Msg("[api] tls listen")
 
 	server := &http.Server{
-		Handler:   Handler,
-		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+		Handler:           Handler,
+		TLSConfig:         &tls.Config{Certificates: []tls.Certificate{cert}},
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 	if err = server.ServeTLS(ln, "", ""); err != nil {
 		log.Fatal().Err(err).Msg("[api] tls serve")
@@ -251,7 +253,15 @@ func restartHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go shell.Restart()
+	path, err := os.Executable()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	log.Debug().Msgf("[api] restart %s", path)
+
+	go syscall.Exec(path, os.Args, os.Environ())
 }
 
 func logHandler(w http.ResponseWriter, r *http.Request) {

@@ -1,7 +1,7 @@
 package streams
 
 import (
-	"net/http"
+	"errors"
 	"net/url"
 	"regexp"
 	"sync"
@@ -26,7 +26,8 @@ func Init() {
 		streams[name] = NewStream(item)
 	}
 
-	api.HandleFunc("api/streams", streamsHandler)
+	api.HandleFunc("api/streams", apiStreams)
+	api.HandleFunc("api/streams.dot", apiStreamsDOT)
 
 	if cfg.Publish == nil {
 		return
@@ -41,20 +42,29 @@ func Init() {
 	})
 }
 
-func Get(name string) *Stream {
-	return streams[name]
-}
-
 var sanitize = regexp.MustCompile(`\s`)
 
-func New(name string, source string) *Stream {
-	// not allow creating dynamic streams with spaces in the source
+// Validate - not allow creating dynamic streams with spaces in the source
+func Validate(source string) error {
 	if sanitize.MatchString(source) {
-		return nil
+		return errors.New("streams: invalid dynamic source")
+	}
+	return nil
+}
+
+func New(name string, sources ...string) *Stream {
+	for _, source := range sources {
+		if Validate(source) != nil {
+			return nil
+		}
 	}
 
-	stream := NewStream(source)
+	stream := NewStream(sources)
+
+	streamsMu.Lock()
 	streams[name] = stream
+	streamsMu.Unlock()
+
 	return stream
 }
 
@@ -87,6 +97,10 @@ func Patch(name string, source string) *Stream {
 		return nil
 	}
 
+	if Validate(source) != nil {
+		return nil
+	}
+
 	// check an existing stream with this name
 	if stream, ok := streams[name]; ok {
 		stream.SetSource(source)
@@ -94,7 +108,9 @@ func Patch(name string, source string) *Stream {
 	}
 
 	// create new stream with this name
-	return New(name, source)
+	stream := NewStream(source)
+	streams[name] = stream
+	return stream
 }
 
 func GetOrPatch(query url.Values) *Stream {
@@ -105,7 +121,7 @@ func GetOrPatch(query url.Values) *Stream {
 	}
 
 	// check if src is stream name
-	if stream, ok := streams[source]; ok {
+	if stream := Get(source); stream != nil {
 		return stream
 	}
 
@@ -120,92 +136,41 @@ func GetOrPatch(query url.Values) *Stream {
 	return Patch(source, source)
 }
 
-func GetAll() (names []string) {
+var log zerolog.Logger
+
+// streams map
+
+var streams = map[string]*Stream{}
+var streamsMu sync.Mutex
+
+func Get(name string) *Stream {
+	streamsMu.Lock()
+	defer streamsMu.Unlock()
+	return streams[name]
+}
+
+func Delete(name string) {
+	streamsMu.Lock()
+	defer streamsMu.Unlock()
+	delete(streams, name)
+}
+
+func GetAllNames() []string {
+	streamsMu.Lock()
+	names := make([]string, 0, len(streams))
 	for name := range streams {
 		names = append(names, name)
 	}
-	return
+	streamsMu.Unlock()
+	return names
 }
 
-func Streams() map[string]*Stream {
-	return streams
-}
-
-func Delete(id string) {
-	delete(streams, id)
-}
-
-func streamsHandler(w http.ResponseWriter, r *http.Request) {
-	query := r.URL.Query()
-	src := query.Get("src")
-
-	// without source - return all streams list
-	if src == "" && r.Method != "POST" {
-		api.ResponseJSON(w, streams)
-		return
+func GetAllSources() map[string][]string {
+	streamsMu.Lock()
+	sources := make(map[string][]string, len(streams))
+	for name, stream := range streams {
+		sources[name] = stream.Sources()
 	}
-
-	// Not sure about all this API. Should be rewrited...
-	switch r.Method {
-	case "GET":
-		api.ResponsePrettyJSON(w, streams[src])
-
-	case "PUT":
-		name := query.Get("name")
-		if name == "" {
-			name = src
-		}
-
-		if New(name, src) == nil {
-			http.Error(w, "", http.StatusBadRequest)
-			return
-		}
-
-		if err := app.PatchConfig(name, src, "streams"); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-		}
-
-	case "PATCH":
-		name := query.Get("name")
-		if name == "" {
-			http.Error(w, "", http.StatusBadRequest)
-			return
-		}
-
-		// support {input} templates: https://github.com/AlexxIT/go2rtc#module-hass
-		if Patch(name, src) == nil {
-			http.Error(w, "", http.StatusBadRequest)
-		}
-
-	case "POST":
-		// with dst - redirect source to dst
-		if dst := query.Get("dst"); dst != "" {
-			if stream := Get(dst); stream != nil {
-				if err := stream.Play(src); err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-				} else {
-					api.ResponseJSON(w, stream)
-				}
-			} else if stream = Get(src); stream != nil {
-				if err := stream.Publish(dst); err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-				}
-			} else {
-				http.Error(w, "", http.StatusNotFound)
-			}
-		} else {
-			http.Error(w, "", http.StatusBadRequest)
-		}
-
-	case "DELETE":
-		delete(streams, src)
-
-		if err := app.PatchConfig(src, nil, "streams"); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-		}
-	}
+	streamsMu.Unlock()
+	return sources
 }
-
-var log zerolog.Logger
-var streams = map[string]*Stream{}
-var streamsMu sync.Mutex

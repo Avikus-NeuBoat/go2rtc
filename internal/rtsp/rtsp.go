@@ -1,6 +1,7 @@
 package rtsp
 
 import (
+	"errors"
 	"io"
 	"net"
 	"net/url"
@@ -21,7 +22,7 @@ func Init() {
 			Username     string `yaml:"username" json:"-"`
 			Password     string `yaml:"password" json:"-"`
 			DefaultQuery string `yaml:"default_query" json:"default_query"`
-			PacketSize   uint16 `yaml:"pkt_size"`
+			PacketSize   uint16 `yaml:"pkt_size" json:"pkt_size,omitempty"`
 		} `yaml:"rtsp"`
 	}
 
@@ -147,6 +148,7 @@ func tcpHandler(conn *rtsp.Conn) {
 	var closer func()
 
 	trace := log.Trace().Enabled()
+	level := zerolog.WarnLevel
 
 	conn.Listen(func(msg any) {
 		if trace {
@@ -184,12 +186,38 @@ func tcpHandler(conn *rtsp.Conn) {
 				}
 			}
 
+			if query.Get("backchannel") == "1" {
+				conn.Medias = append(conn.Medias, &core.Media{
+					Kind:      core.KindAudio,
+					Direction: core.DirectionRecvonly,
+					Codecs: []*core.Codec{
+						{Name: core.CodecOpus, ClockRate: 48000, Channels: 2},
+						{Name: core.CodecPCM, ClockRate: 16000},
+						{Name: core.CodecPCMA, ClockRate: 16000},
+						{Name: core.CodecPCMU, ClockRate: 16000},
+						{Name: core.CodecPCM, ClockRate: 8000},
+						{Name: core.CodecPCMA, ClockRate: 8000},
+						{Name: core.CodecPCMU, ClockRate: 8000},
+					},
+				})
+			}
+
 			if s := query.Get("pkt_size"); s != "" {
 				conn.PacketSize = uint16(core.Atoi(s))
 			}
 
+			// param name like ffmpeg style https://ffmpeg.org/ffmpeg-protocols.html
+			if s := query.Get("log_level"); s != "" {
+				if lvl, err := zerolog.ParseLevel(s); err == nil {
+					level = lvl
+				}
+			}
+
+			// will help to protect looping requests to same source
+			conn.Connection.Source = query.Get("source")
+
 			if err := stream.AddConsumer(conn); err != nil {
-				log.Warn().Err(err).Str("stream", name).Msg("[rtsp]")
+				log.WithLevel(level).Err(err).Str("stream", name).Msg("[rtsp]")
 				return
 			}
 
@@ -210,6 +238,11 @@ func tcpHandler(conn *rtsp.Conn) {
 				return
 			}
 
+			query := conn.URL.Query()
+			if s := query.Get("timeout"); s != "" {
+				conn.Timeout = core.Atoi(s)
+			}
+
 			log.Debug().Str("stream", name).Msg("[rtsp] new producer")
 
 			stream.AddProducer(conn)
@@ -221,8 +254,10 @@ func tcpHandler(conn *rtsp.Conn) {
 	})
 
 	if err := conn.Accept(); err != nil {
-		if err != io.EOF {
-			log.Warn().Err(err).Caller().Send()
+		if errors.Is(err, rtsp.FailedAuth) {
+			log.Warn().Str("remote_addr", conn.Connection.RemoteAddr).Msg("[rtsp] failed authentication")
+		} else if err != io.EOF {
+			log.WithLevel(level).Err(err).Caller().Send()
 		}
 		if closer != nil {
 			closer()
@@ -239,7 +274,7 @@ func tcpHandler(conn *rtsp.Conn) {
 
 	if closer != nil {
 		if err := conn.Handle(); err != nil {
-			log.Debug().Msgf("[rtsp] handle=%s", err)
+			log.Debug().Err(err).Msg("[rtsp] handle")
 		}
 
 		closer()

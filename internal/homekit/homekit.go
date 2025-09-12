@@ -22,12 +22,11 @@ import (
 func Init() {
 	var cfg struct {
 		Mod map[string]struct {
-			Pin           string   `json:"pin"`
-			Name          string   `json:"name"`
-			DeviceID      string   `json:"device_id"`
-			DevicePrivate string   `json:"device_private"`
-			Pairings      []string `json:"pairings"`
-			//Listen        string   `json:"listen"`
+			Pin           string   `yaml:"pin"`
+			Name          string   `yaml:"name"`
+			DeviceID      string   `yaml:"device_id"`
+			DevicePrivate string   `yaml:"device_private"`
+			Pairings      []string `yaml:"pairings"`
 		} `yaml:"homekit"`
 	}
 	app.LoadConfig(&cfg)
@@ -80,7 +79,7 @@ func Init() {
 			Handler:       homekit.ServerHandler(srv),
 		}
 
-		if url := findHomeKitURL(stream); url != "" {
+		if url := findHomeKitURL(stream.Sources()); url != "" {
 			// 1. Act as transparent proxy for HomeKit camera
 			dial := func() (net.Conn, error) {
 				client, err := homekit.Dial(url, srtp.Server)
@@ -119,8 +118,8 @@ func Init() {
 		servers[host] = srv
 	}
 
-	api.HandleFunc(hap.PathPairSetup, hapPairSetup)
-	api.HandleFunc(hap.PathPairVerify, hapPairVerify)
+	api.HandleFunc(hap.PathPairSetup, hapHandler)
+	api.HandleFunc(hap.PathPairVerify, hapHandler)
 
 	log.Trace().Msgf("[homekit] mdns: %s", entries)
 
@@ -134,21 +133,34 @@ func Init() {
 var log zerolog.Logger
 var servers map[string]*server
 
-func streamHandler(url string) (core.Producer, error) {
+func streamHandler(rawURL string) (core.Producer, error) {
 	if srtp.Server == nil {
 		return nil, errors.New("homekit: can't work without SRTP server")
 	}
 
-	return homekit.Dial(url, srtp.Server)
-}
-
-func hapPairSetup(w http.ResponseWriter, r *http.Request) {
-	srv, ok := servers[r.Host]
-	if !ok {
-		log.Error().Msg("[homekit] unknown host: " + r.Host)
-		return
+	rawURL, rawQuery, _ := strings.Cut(rawURL, "#")
+	client, err := homekit.Dial(rawURL, srtp.Server)
+	if client != nil && rawQuery != "" {
+		query := streams.ParseQuery(rawQuery)
+		client.Bitrate = parseBitrate(query.Get("bitrate"))
 	}
 
+	return client, err
+}
+
+func resolve(host string) *server {
+	if len(servers) == 1 {
+		for _, srv := range servers {
+			return srv
+		}
+	}
+	if srv, ok := servers[host]; ok {
+		return srv
+	}
+	return nil
+}
+
+func hapHandler(w http.ResponseWriter, r *http.Request) {
 	conn, rw, err := w.(http.Hijacker).Hijack()
 	if err != nil {
 		return
@@ -156,32 +168,29 @@ func hapPairSetup(w http.ResponseWriter, r *http.Request) {
 
 	defer conn.Close()
 
-	if err = srv.hap.PairSetup(r, rw, conn); err != nil {
-		log.Error().Err(err).Caller().Send()
-	}
-}
-
-func hapPairVerify(w http.ResponseWriter, r *http.Request) {
-	srv, ok := servers[r.Host]
-	if !ok {
+	// Can support multiple HomeKit cameras on single port ONLY for Apple devices.
+	// Doesn't support Home Assistant and any other open source projects
+	// because they don't send the host header in requests.
+	srv := resolve(r.Host)
+	if srv == nil {
 		log.Error().Msg("[homekit] unknown host: " + r.Host)
+		_ = hap.WriteBackoff(rw)
 		return
 	}
 
-	conn, rw, err := w.(http.Hijacker).Hijack()
-	if err != nil {
-		return
+	switch r.RequestURI {
+	case hap.PathPairSetup:
+		err = srv.hap.PairSetup(r, rw, conn)
+	case hap.PathPairVerify:
+		err = srv.hap.PairVerify(r, rw, conn)
 	}
 
-	defer conn.Close()
-
-	if err = srv.hap.PairVerify(r, rw, conn); err != nil && err != io.EOF {
+	if err != nil && err != io.EOF {
 		log.Error().Err(err).Caller().Send()
 	}
 }
 
-func findHomeKitURL(stream *streams.Stream) string {
-	sources := stream.Sources()
+func findHomeKitURL(sources []string) string {
 	if len(sources) == 0 {
 		return ""
 	}
@@ -199,4 +208,25 @@ func findHomeKitURL(stream *streams.Stream) string {
 	}
 
 	return ""
+}
+
+func parseBitrate(s string) int {
+	n := len(s)
+	if n == 0 {
+		return 0
+	}
+
+	var k int
+	switch n--; s[n] {
+	case 'K':
+		k = 1024
+		s = s[:n]
+	case 'M':
+		k = 1024 * 1024
+		s = s[:n]
+	default:
+		k = 1
+	}
+
+	return k * core.Atoi(s)
 }

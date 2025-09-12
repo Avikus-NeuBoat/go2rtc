@@ -1,3 +1,10 @@
+## Tests
+
+- go2rtc rtmp client => Reolink
+- go2rtc rtmp server <= Dahua
+- go2rtc rtmp publish => YouTube
+- go2rtc rtmp publish => Telegram
+
 ## Logs
 
 ```
@@ -17,3 +24,4 @@ response []interface {}{"onStatus", 0, interface {}(nil), map[string]interface {
 - https://en.wikipedia.org/wiki/Flash_Video
 - https://en.wikipedia.org/wiki/Real-Time_Messaging_Protocol
 - https://rtmp.veriskope.com/pdf/rtmp_specification_1.0.pdf
+- https://rtmp.veriskope.com/docs/spec/
