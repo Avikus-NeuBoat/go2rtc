@@ -41,12 +41,11 @@ class VideoStream extends VideoRTC {
             pointer-events: none;
         }
         </style>
-        <div class="info">
-            <div class="status"></div>
-            <div class="mode"></div>
-        </div>
         `;
-
+        // <div class="info">
+        //     <div class="status"></div>
+        //     <div class="mode"></div>
+        // </div>
         const info = this.querySelector('.info');
         this.insertBefore(this.video, info);
     }
