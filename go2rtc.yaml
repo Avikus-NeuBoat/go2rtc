@@ -23,7 +23,8 @@ srtp:
 
 streams:
   camera0: rtsp://127.0.0.1:8554/test
-
+  camera1: rtsp://127.0.0.1:8554/test1
+  camera2: rtsp://127.0.0.1:8554/test2
 webrtc:
   ice_servers:
     - urls: [stun:localhost:3478]
